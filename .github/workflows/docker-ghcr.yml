@@ -1,0 +1,212 @@
+name: Docker Image (GHCR)
+
+# Builds a multi-arch redlib container image from source (Dockerfile.alpine) and
+# pushes it to the GitHub Container Registry.
+#
+# Images produced:
+#   ghcr.io/<owner>/redlib:latest      (default branch only)
+#   ghcr.io/<owner>/redlib:<sha>
+#   ghcr.io/<owner>/redlib:<semver>    (v* tags only)
+#
+# No secrets are required: GITHUB_TOKEN has write access to the org/user
+# package registry. If the push is denied with "denied", grant this repository
+# access under Settings -> Packages -> Package settings -> "Add Actions workflow"
+# or set the package visibility / workflow permissions to read+write packages.
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+    paths-ignore:
+      - "**.md"
+      - "compose.*"
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - "**.md"
+      - "compose.*"
+  workflow_dispatch: {}
+
+env:
+  REGISTRY_IMAGE: ghcr.io/${{ github.repository }}
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-ghcr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Skip duplicated runs caused by both `push` and `pull_request` on PRs opened
+  # in this repository, but keep running for fork PRs so they still get tested.
+  prereq:
+    name: Check if build is needed
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      should_push: ${{ steps.check.outputs.should_push }}
+    steps:
+      - name: Check event
+        id: check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.repository }}
+        run: |
+          should_build=true
+          should_push=false
+
+          case "$EVENT_NAME" in
+            push)
+              # Pushes to the default branch and version tags get published.
+              should_push=true
+              ;;
+            workflow_dispatch)
+              should_push=true
+              ;;
+            pull_request)
+              # For PRs we only build (no push). Skip when the PR comes from a
+              # branch of this same repository, because the `push` event for
+              # that branch already builds it.
+              if [ "$HEAD_REPO" = "$BASE_REPO" ]; then
+                should_build=false
+              fi
+              ;;
+          esac
+
+          echo "build=$should_build" >> "$GITHUB_OUTPUT"
+          echo "should_push=$should_push" >> "$GITHUB_OUTPUT"
+          echo "event=$EVENT_NAME build=$should_build push=$should_push"
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: prereq
+    if: needs.prereq.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux/amd64, target: x86_64-unknown-linux-musl, cross_image: x86_64-musl, gnu_packages: "" }
+          - { platform: linux/arm64, target: aarch64-unknown-linux-musl, cross_image: aarch64-musl, gnu_packages: "gcc-aarch64-linux-gnu g++-aarch64-linux-gnu" }
+          - { platform: linux/arm/v7, target: armv7-unknown-linux-musleabihf, cross_image: armv7-musleabihf, gnu_packages: "gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf" }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        if: needs.prereq.outputs.should_push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (digest only)
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.alpine
+          target: release
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            RUST_TARGET=${{ matrix.target }}
+            RUST_CROSS_IMAGE=${{ matrix.cross_image }}
+            CROSS_GNU_PACKAGES=${{ matrix.gnu_packages }}
+            BINDGEN_EXTRA_CLANG_ARGS=${{ matrix.target == 'armv7-unknown-linux-musleabihf' && '--target=arm-linux-gnueabihf --sysroot=/usr/arm-linux-gnueabihf' || '' }}
+          provenance: false
+          # Push by digest here; the multi-arch manifest list is created in the
+          # `merge` job. On pull requests nothing is pushed, the image is just
+          # built to verify it compiles and packages.
+          outputs: >-
+            type=image,name=${{ env.REGISTRY_IMAGE }},push-by-digest=true,name-canonical=true,push=${{ needs.prereq.outputs.should_push }}
+
+      - name: Export digest
+        if: needs.prereq.outputs.should_push == 'true'
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: needs.prereq.outputs.should_push == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.target }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Publish multi-arch manifest
+    runs-on: ubuntu-latest
+    needs:
+      - prereq
+      - build
+    if: >-
+      always() &&
+      needs.prereq.outputs.should_push == 'true' &&
+      needs.build.result == 'success'
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4.1.7
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY_IMAGE }}@sha256:%s ' *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect "${{ env.REGISTRY_IMAGE }}:${{ steps.meta.outputs.version }}"
