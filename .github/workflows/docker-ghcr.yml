@@ -237,9 +237,14 @@ jobs:
         env:
           REGISTRY_IMAGE: ${{ env.REGISTRY_IMAGE }}
         run: |
+          sources=()
+          for digest in *; do
+            sources+=("${REGISTRY_IMAGE}@sha256:${digest}")
+          done
+
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '%s@sha256:%s ' "$REGISTRY_IMAGE" *)
+            "${sources[@]}"
 
       - name: Inspect image
         env:
