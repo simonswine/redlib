@@ -89,17 +89,33 @@ jobs:
     name: Build ${{ matrix.platform }}
     needs: prereq
     if: needs.prereq.outputs.build == 'true'
-    runs-on: ubuntu-latest
+    # Each job builds natively on its own architecture runner. Dockerfile.alpine
+    # cross-compiles the *binary*, but the build scripts (cmake/libclang/bindgen)
+    # must execute natively, so QEMU emulation of the whole image is both very
+    # slow and breaks bindgen's sysroot detection.
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
     strategy:
       fail-fast: false
       matrix:
+        # linux/arm/v7 is intentionally not built: it needs a BINDGEN_EXTRA_CLANG_ARGS
+        # value containing a space ("--target=... --sysroot=..."), and
+        # docker/build-push-action splits `build-args` on whitespace, so the
+        # trailing word is parsed as a buildx flag ("unknown flag: --sysroot")
+        # and bindgen then fails with "'stdlib.h' file not found".
         include:
-          - { platform: linux/amd64, target: x86_64-unknown-linux-musl, cross_image: x86_64-musl, gnu_packages: "" }
-          - { platform: linux/arm64, target: aarch64-unknown-linux-musl, cross_image: aarch64-musl, gnu_packages: "gcc-aarch64-linux-gnu g++-aarch64-linux-gnu" }
-          - { platform: linux/arm/v7, target: armv7-unknown-linux-musleabihf, cross_image: armv7-musleabihf, gnu_packages: "gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf" }
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            cross_image: x86_64-musl
+            gnu_packages: ""
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            cross_image: aarch64-musl
+            gnu_packages: "gcc-aarch64-linux-gnu g++-aarch64-linux-gnu"
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -116,9 +132,6 @@ jobs:
             type=sha,prefix=,format=short
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -138,13 +151,19 @@ jobs:
           context: .
           file: Dockerfile.alpine
           target: release
+          # Single-platform per job (native runner).
+          #
+          # NOTE on build-args: docker/build-push-action splits the `build-args`
+          # input on whitespace when building its argv, so no value here may
+          # contain a space or it would be split into a second argument and parsed
+          # as a buildx flag. Quoting does not help either - the quotes end up
+          # inside the ARG value. See the matrix comment above for arm/v7.
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
+          build-args: |-
             RUST_TARGET=${{ matrix.target }}
             RUST_CROSS_IMAGE=${{ matrix.cross_image }}
             CROSS_GNU_PACKAGES=${{ matrix.gnu_packages }}
-            BINDGEN_EXTRA_CLANG_ARGS=${{ matrix.target == 'armv7-unknown-linux-musleabihf' && '--target=arm-linux-gnueabihf --sysroot=/usr/arm-linux-gnueabihf' || '' }}
           provenance: false
           # Push by digest here; the multi-arch manifest list is created in the
           # `merge` job. On pull requests nothing is pushed, the image is just
